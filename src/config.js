@@ -40,7 +40,7 @@ export const SALES_PAGES = [
   },
   {
     id: 'Sales Page 04',
-    name: 'TK',
+    name: 'Pd',
     description: 'หน้าเซลเพจสำรอง',
     owner: 'Daniel00078',
     repo: 'Pd',
