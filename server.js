@@ -1,11 +1,11 @@
-require("dotenv").config();
+import "dotenv/config";
 
-const express = require("express");
-const session = require("express-session");
-const cors = require("cors");
-const { createAppAuth } = require("@octokit/auth-app");
-const { Octokit } = require("@octokit/rest");
-const SALES_PAGES = require("./src/config").default;
+import express from "express";
+import session from "express-session";
+import cors from "cors";
+import { createAppAuth } from "@octokit/auth-app";
+import { Octokit } from "@octokit/rest";
+import SALES_PAGES from "./src/config.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,7 +13,10 @@ const PORT = process.env.PORT || 3000;
 const FRONTEND_URL = process.env.FRONTEND_URL;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 
+// ---------- App configuration ----------
+
 app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "1mb" }));
 
 app.use(
@@ -42,10 +45,9 @@ app.use(
 
 function getAccountSlot(username) {
   for (let slot = 1; slot <= 5; slot++) {
-    if (
-      process.env[`USER_${slot}_USERNAME`] &&
-      process.env[`USER_${slot}_USERNAME`] === username
-    ) {
+    const configuredUsername = process.env[`USER_${slot}_USERNAME`];
+
+    if (configuredUsername && configuredUsername === username) {
       return slot;
     }
   }
@@ -56,16 +58,16 @@ function getAccountSlot(username) {
 function isAuthenticated(req) {
   return Boolean(
     req.session &&
-    req.session.authenticated &&
-    req.session.username
+      req.session.authenticated &&
+      req.session.username
   );
 }
 
 function isAdmin(req) {
   return Boolean(
     isAuthenticated(req) &&
-    process.env.ADMIN_USERNAME &&
-    req.session.username === process.env.ADMIN_USERNAME
+      process.env.ADMIN_USERNAME &&
+      req.session.username === process.env.ADMIN_USERNAME
   );
 }
 
@@ -78,12 +80,12 @@ function canAccessPage(req, page) {
     return false;
   }
 
-  // Admin เข้าได้ทุกเซลเพจ รวมถึง Pd
+  // Admin สามารถเข้าถึงทุกเซลเพจ รวมถึง Pd
   if (isAdmin(req)) {
     return true;
   }
 
-  // ห้ามบัญชีทั่วไปเข้าเซลเพจที่กำหนดเป็น Admin-only
+  // บัญชีทั่วไปเข้าเซลเพจที่เป็น Admin-only ไม่ได้
   if (page.adminOnly) {
     return false;
   }
@@ -92,8 +94,8 @@ function canAccessPage(req, page) {
 
   return Boolean(
     slot &&
-    Array.isArray(page.allowedUserSlots) &&
-    page.allowedUserSlots.includes(slot)
+      Array.isArray(page.allowedUserSlots) &&
+      page.allowedUserSlots.includes(slot)
   );
 }
 
@@ -143,13 +145,20 @@ function requirePageAccess(req, res, next) {
 function validateGitHubConfig() {
   return Boolean(
     process.env.GITHUB_APP_ID &&
-    process.env.GITHUB_APP_PRIVATE_KEY &&
-    process.env.GITHUB_INSTALLATION_ID
+      process.env.GITHUB_APP_PRIVATE_KEY &&
+      process.env.GITHUB_INSTALLATION_ID
   );
 }
 
 function getPrivateKey() {
-  return process.env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+
+  if (!privateKey) {
+    throw new Error("ยังไม่ได้ตั้งค่า GITHUB_APP_PRIVATE_KEY");
+  }
+
+  // แปลงตัวอักษร \n ใน Environment Variable เป็น newline จริง
+  return privateKey.replace(/\\n/g, "\n");
 }
 
 async function getGitHubClient() {
@@ -174,11 +183,10 @@ async function getGitHubClient() {
 
 // ---------- Pixel ID helpers ----------
 
-// รองรับ ID ที่ส่งมาเป็น string หรือ array
 function normalizePixelIds(value) {
   const input = Array.isArray(value)
     ? value
-    : String(value || "").split(/[\n,\s]+/);
+    : String(value ?? "").split(/[\n,\s]+/);
 
   const ids = input
     .map((item) => String(item).trim())
@@ -193,21 +201,17 @@ function normalizePixelIds(value) {
   return [...new Set(ids)];
 }
 
-// ดึง Pixel IDs จากโค้ด Facebook Pixel ที่พบใน HTML
+// ดึง Pixel IDs จากคำสั่ง fbq('init', 'PIXEL_ID')
 function extractPixelIds(html) {
   const ids = new Set();
 
-  const patterns = [
-    /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
-    /_fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
-  ];
+  const pattern =
+    /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])(\d+)\2\s*\)/g;
 
-  for (const pattern of patterns) {
-    let match;
+  let match;
 
-    while ((match = pattern.exec(html)) !== null) {
-      ids.add(match[1]);
-    }
+  while ((match = pattern.exec(html)) !== null) {
+    ids.add(match[3]);
   }
 
   return [...ids];
@@ -217,7 +221,8 @@ function extractPixelIds(html) {
 function replacePixelIds(html, pixelIds) {
   const ids = normalizePixelIds(pixelIds);
 
-  const marker = /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;/g;
+  const marker =
+    /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;?/g;
 
   if (!marker.test(html)) {
     throw new Error(
@@ -229,36 +234,19 @@ function replacePixelIds(html, pixelIds) {
 
   let first = true;
 
-  // คงตำแหน่งคำสั่งแรกไว้ และลบคำสั่ง init เดิมที่เหลือ
-  // จากนั้นสร้างคำสั่ง init เพิ่มสำหรับ ID ที่เหลือ
-  let output = html.replace(marker, () => {
-    if (first && ids.length > 0) {
-      first = false;
-      return `fbq('init', '${ids[0]}');`;
+  // แทนคำสั่ง init แรกด้วยรายการ ID ใหม่
+  // และลบคำสั่ง init เดิมที่เหลือ
+  const output = html.replace(marker, () => {
+    if (!first) {
+      return "";
     }
 
-    return "";
-  });
+    first = false;
 
-  if (ids.length > 1) {
-    const firstInit = `fbq('init', '${ids[0]}');`;
-    const extraInits = ids
-      .slice(1)
+    return ids
       .map((id) => `fbq('init', '${id}');`)
       .join("\n");
-
-    output = output.replace(
-      firstInit,
-      `${firstInit}\n${extraInits}`
-    );
-  }
-
-  if (ids.length === 0) {
-    output = output.replace(
-      /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;/g,
-      ""
-    );
-  }
+  });
 
   return output;
 }
@@ -278,7 +266,7 @@ app.get("/api/status", (req, res) => {
 // ---------- API: login ----------
 
 app.post("/api/login", (req, res, next) => {
-  const username = String(req.body?.username || "");
+  const username = String(req.body?.username || "").trim();
   const password = String(req.body?.password || "");
 
   if (!username || !password) {
@@ -311,13 +299,17 @@ app.post("/api/login", (req, res, next) => {
   }
 
   req.session.regenerate((err) => {
-    if (err) return next(err);
+    if (err) {
+      return next(err);
+    }
 
     req.session.authenticated = true;
     req.session.username = username;
 
     req.session.save((saveErr) => {
-      if (saveErr) return next(saveErr);
+      if (saveErr) {
+        return next(saveErr);
+      }
 
       res.json({
         success: true,
@@ -333,7 +325,9 @@ app.post("/api/login", (req, res, next) => {
 
 app.post("/api/logout", (req, res, next) => {
   req.session.destroy((err) => {
-    if (err) return next(err);
+    if (err) {
+      return next(err);
+    }
 
     res.clearCookie("pixel_manager_session", {
       httpOnly: true,
@@ -394,7 +388,10 @@ app.post(
   async (req, res, next) => {
     try {
       const page = req.salesPage;
-      const pixelIds = normalizePixelIds(req.body?.pixelIds);
+
+      // รองรับทั้ง pixelIds และ ids จากหน้าเว็บ
+      const submittedIds = req.body?.pixelIds ?? req.body?.ids;
+      const pixelIds = normalizePixelIds(submittedIds);
 
       if (pixelIds.length === 0) {
         return res.status(400).json({
@@ -432,13 +429,17 @@ app.post(
         });
       }
 
+      const commitMessage = String(
+        req.body?.message || `Update Facebook Pixel IDs for ${page.name}`
+      ).trim();
+
       const result = await octokit.repos.createOrUpdateFileContents({
         owner: page.owner,
         repo: page.repo,
         path: page.path,
         branch: page.branch,
         sha: current.data.sha,
-        message: `Update Facebook Pixel IDs for ${page.name}`,
+        message: commitMessage || `Update Facebook Pixel IDs for ${page.name}`,
         content: Buffer.from(newHtml, "utf8").toString("base64"),
       });
 
@@ -467,6 +468,8 @@ app.use((err, req, res, next) => {
     error: "เกิดข้อผิดพลาดในระบบ กรุณาตรวจสอบการตั้งค่า Backend",
   });
 });
+
+// ---------- Start server ----------
 
 app.listen(PORT, () => {
   console.log(`Pixel Manager API listening on port ${PORT}`);
