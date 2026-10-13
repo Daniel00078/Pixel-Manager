@@ -1,421 +1,473 @@
+require("dotenv").config();
 
-import 'dotenv/config'
-import express from 'express'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import session from 'express-session'
-import helmet from 'helmet'
-import { App as GitHubApp } from '@octokit/app'
-import { SALES_PAGES } from './src/config.js'
+const express = require("express");
+const session = require("express-session");
+const cors = require("cors");
+const { createAppAuth } = require("@octokit/auth-app");
+const { Octokit } = require("@octokit/rest");
+const SALES_PAGES = require("./src/config").default;
 
-const app = express()
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const port = Number(process.env.PORT || 3001)
-const production = process.env.NODE_ENV === 'production'
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-app.set('trust proxy', 1)
-app.use(helmet({ contentSecurityPolicy: false }))
-app.use(express.json({ limit: '1mb' }))
+const FRONTEND_URL = process.env.FRONTEND_URL;
+const SESSION_SECRET = process.env.SESSION_SECRET;
 
-app.use(session({
-  name: 'pixel_manager_session',
-  secret: process.env.SESSION_SECRET || 'development-only-change-me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: production,
-    maxAge: 8 * 60 * 60 * 1000,
-  },
-}))
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "1mb" }));
 
-// ตรวจสอบ Environment Variables
-const configured = () => Boolean(
-  process.env.GITHUB_APP_ID &&
-  process.env.GITHUB_APP_PRIVATE_KEY &&
-  process.env.GITHUB_INSTALLATION_ID &&
-  process.env.SESSION_SECRET &&
-  Array.from({ length: 5 }, (_, i) => i + 1).every(
-    (i) =>
-      process.env[`USER_${i}_USERNAME`] &&
-      process.env[`USER_${i}_PASSWORD`]
-  )
-)
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+  })
+);
 
-// ผู้ใช้งาน 5 บัญชี
-const users = () =>
-  Array.from({ length: 5 }, (_, i) => ({
-    username: process.env[`USER_${i + 1}_USERNAME`],
-    password: process.env[`USER_${i + 1}_PASSWORD`],
-  })).filter((u) => u.username && u.password)
+app.use(
+  session({
+    name: "pixel_manager_session",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "none",
+      maxAge: 8 * 60 * 60 * 1000,
+    },
+  })
+);
 
-// ตรวจสอบว่าเป็นแอดมินหรือไม่
-const isAdmin = (req) => Boolean(
-  req.session?.authenticated &&
-  req.session?.username &&
-  process.env.ADMIN_USERNAME &&
-  req.session.username === process.env.ADMIN_USERNAME
-)
+// ---------- Accounts ----------
 
-// สร้าง GitHub App
-const githubApp = () => {
-  const appId = process.env.GITHUB_APP_ID
-  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY
-    ?.replace(/\\n/g, '\n')
-  const installationId = Number(process.env.GITHUB_INSTALLATION_ID)
-
-  if (
-    !appId ||
-    !privateKey ||
-    !Number.isSafeInteger(installationId) ||
-    installationId <= 0
-  ) {
-    throw new Error(
-      'การตั้งค่า GitHub App ไม่ครบ กรุณาตรวจ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY และ GITHUB_INSTALLATION_ID'
-    )
+function getAccountSlot(username) {
+  for (let slot = 1; slot <= 5; slot++) {
+    if (
+      process.env[`USER_${slot}_USERNAME`] &&
+      process.env[`USER_${slot}_USERNAME`] === username
+    ) {
+      return slot;
+    }
   }
 
-  return new GitHubApp({ appId, privateKey })
+  return null;
 }
 
-const getGitHubClient = async () => {
-  const installationId = Number(process.env.GITHUB_INSTALLATION_ID)
+function isAuthenticated(req) {
+  return Boolean(
+    req.session &&
+    req.session.authenticated &&
+    req.session.username
+  );
+}
 
-  if (!Number.isSafeInteger(installationId) || installationId <= 0) {
-    throw new Error('GITHUB_INSTALLATION_ID ไม่ถูกต้อง')
+function isAdmin(req) {
+  return Boolean(
+    isAuthenticated(req) &&
+    process.env.ADMIN_USERNAME &&
+    req.session.username === process.env.ADMIN_USERNAME
+  );
+}
+
+function pageById(id) {
+  return SALES_PAGES.find((page) => page.id === id);
+}
+
+function canAccessPage(req, page) {
+  if (!isAuthenticated(req) || !page) {
+    return false;
   }
 
-  return githubApp().getInstallationOctokit(installationId)
+  // Admin เข้าได้ทุกเซลเพจ รวมถึง Pd
+  if (isAdmin(req)) {
+    return true;
+  }
+
+  // ห้ามบัญชีทั่วไปเข้าเซลเพจที่กำหนดเป็น Admin-only
+  if (page.adminOnly) {
+    return false;
+  }
+
+  const slot = getAccountSlot(req.session.username);
+
+  return Boolean(
+    slot &&
+    Array.isArray(page.allowedUserSlots) &&
+    page.allowedUserSlots.includes(slot)
+  );
 }
 
-// ค้นหาเซลเพจที่ตั้งค่า Repository ถูกต้อง
-const pageById = (id) =>
-  SALES_PAGES.find(
-    (page) =>
-      page.id === id &&
-      page.owner &&
-      page.repo &&
-      page.branch &&
-      page.path &&
-      !page.owner.startsWith('YOUR_') &&
-      !page.repo.startsWith('YOUR_')
-  )
+function accessiblePageIds(req) {
+  if (!isAuthenticated(req)) {
+    return [];
+  }
 
-// ตรวจสอบการเข้าสู่ระบบ
-const requireAuth = (req, res, next) => {
-  if (!req.session?.authenticated) {
+  return SALES_PAGES
+    .filter((page) => canAccessPage(req, page))
+    .map((page) => page.id);
+}
+
+// ---------- Authentication middleware ----------
+
+function requireAuth(req, res, next) {
+  if (!isAuthenticated(req)) {
     return res.status(401).json({
-      error: 'กรุณาเข้าสู่ระบบก่อนใช้งาน',
-    })
+      error: "กรุณาเข้าสู่ระบบก่อน",
+    });
   }
 
-  next()
+  next();
 }
 
-// ตรวจสอบสิทธิ์ของเซลเพจ
-const requirePageAccess = (req, res, next) => {
-  const page = pageById(req.params.id)
+function requirePageAccess(req, res, next) {
+  const page = pageById(req.params.id);
 
   if (!page) {
     return res.status(404).json({
-      error: 'ไม่พบเซลเพจ หรือยังไม่ได้ตั้งค่า Repository ใน src/config.js',
-    })
+      error: "ไม่พบเซลเพจนี้",
+    });
   }
 
-  // หน้า adminOnly ต้องเป็นแอดมินเท่านั้น
-  if (page.adminOnly && !isAdmin(req)) {
+  if (!canAccessPage(req, page)) {
     return res.status(403).json({
-      error: 'เซลเพจนี้อนุญาตให้แอดมินใช้งานเท่านั้น',
-    })
+      error: "บัญชีของคุณไม่มีสิทธิ์เข้าถึงเซลเพจนี้",
+    });
   }
 
-  next()
+  req.salesPage = page;
+  next();
 }
 
-// แปลง HTML เป็นรายการ Pixel ID
-function parseIds(html) {
-  const init = [
-    ...html.matchAll(
-      /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]\s*\)/gi
-    ),
-  ].map((m) => m[1])
+// ---------- GitHub App ----------
 
-  const noscript = [
-    ...html.matchAll(
-      /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])(?=[^>]*\bnoscript=1)[^>]*>/gi
-    ),
-  ]
-    .map((m) => m[0].match(/[?&]id=(\d+)/i)?.[1])
-    .filter(Boolean)
+function validateGitHubConfig() {
+  return Boolean(
+    process.env.GITHUB_APP_ID &&
+    process.env.GITHUB_APP_PRIVATE_KEY &&
+    process.env.GITHUB_INSTALLATION_ID
+  );
+}
 
-  const ids = [...new Set([...init, ...noscript])]
+function getPrivateKey() {
+  return process.env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, "\n");
+}
 
-  if (!ids.length) {
+async function getGitHubClient() {
+  if (!validateGitHubConfig()) {
+    throw new Error("ยังตั้งค่า GitHub App ไม่ครบ");
+  }
+
+  const auth = createAppAuth({
+    appId: process.env.GITHUB_APP_ID,
+    privateKey: getPrivateKey(),
+    installationId: process.env.GITHUB_INSTALLATION_ID,
+  });
+
+  const installationAuth = await auth({
+    type: "installation",
+  });
+
+  return new Octokit({
+    auth: installationAuth.token,
+  });
+}
+
+// ---------- Pixel ID helpers ----------
+
+// รองรับ ID ที่ส่งมาเป็น string หรือ array
+function normalizePixelIds(value) {
+  const input = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[\n,\s]+/);
+
+  const ids = input
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+
+  for (const id of ids) {
+    if (!/^\d+$/.test(id)) {
+      throw new Error(`Pixel ID ไม่ถูกต้อง: ${id}`);
+    }
+  }
+
+  return [...new Set(ids)];
+}
+
+// ดึง Pixel IDs จากโค้ด Facebook Pixel ที่พบใน HTML
+function extractPixelIds(html) {
+  const ids = new Set();
+
+  const patterns = [
+    /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
+    /_fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+
+    while ((match = pattern.exec(html)) !== null) {
+      ids.add(match[1]);
+    }
+  }
+
+  return [...ids];
+}
+
+// เปลี่ยน Pixel IDs ในคำสั่ง fbq('init', '...')
+function replacePixelIds(html, pixelIds) {
+  const ids = normalizePixelIds(pixelIds);
+
+  const marker = /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;/g;
+
+  if (!marker.test(html)) {
     throw new Error(
-      'ไม่พบ Facebook Pixel ในไฟล์ HTML กรุณาตรวจรูปแบบ fbq init หรือ noscript'
-    )
+      "ไม่พบคำสั่ง fbq('init', 'PIXEL_ID') ในไฟล์ HTML"
+    );
   }
 
-  return ids
-}
+  marker.lastIndex = 0;
 
-// แทนที่ Pixel ID โดยรักษาโค้ด HTML ส่วนอื่นไว้
-function rewritePixelIds(html, ids) {
-  const initRegex =
-    /fbq\s*\(\s*['"]init['"]\s*,\s*['"]\d+['"]\s*\)\s*;?/gi
+  let first = true;
 
-  const imgRegex =
-    /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])(?=[^>]*\bnoscript=1)[^>]*>/gi
-
-  let initCount = 0
-
-  let result = html.replace(initRegex, () => {
-    initCount++
-
-    // ใส่รายการใหม่ ณ ตำแหน่งแรก ลบ init เก่าที่เหลือ
-    if (initCount === 1) {
-      return ids.map((id) => `fbq('init', '${id}');`).join('\n    ')
+  // คงตำแหน่งคำสั่งแรกไว้ และลบคำสั่ง init เดิมที่เหลือ
+  // จากนั้นสร้างคำสั่ง init เพิ่มสำหรับ ID ที่เหลือ
+  let output = html.replace(marker, () => {
+    if (first && ids.length > 0) {
+      first = false;
+      return `fbq('init', '${ids[0]}');`;
     }
 
-    return ''
-  })
+    return "";
+  });
 
-  if (initCount === 0) {
-    throw new Error('ไม่พบ fbq init ในไฟล์ HTML จึงหยุดการบันทึก')
+  if (ids.length > 1) {
+    const firstInit = `fbq('init', '${ids[0]}');`;
+    const extraInits = ids
+      .slice(1)
+      .map((id) => `fbq('init', '${id}');`)
+      .join("\n");
+
+    output = output.replace(
+      firstInit,
+      `${firstInit}\n${extraInits}`
+    );
   }
 
-  // อัปเดต noscript หากมีอยู่ในไฟล์
-  let imgCount = 0
+  if (ids.length === 0) {
+    output = output.replace(
+      /fbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;/g,
+      ""
+    );
+  }
 
-  result = result.replace(imgRegex, (img) => {
-    imgCount++
-
-    if (imgCount > 1) {
-      return ''
-    }
-
-    const updatedImages = ids.map((id) => {
-      if (!/[?&]id=\d+/i.test(img)) {
-        throw new Error('ไม่พบ Pixel ID ใน URL ของ noscript')
-      }
-
-      return img.replace(
-        /([?&]id=)\d+/i,
-        (_, prefix) => `${prefix}${id}`
-      )
-    })
-
-    return updatedImages.join('\n')
-  })
-
-  return result
+  return output;
 }
 
-// สถานะระบบ
-app.get('/api/status', (req, res) => {
+// ---------- API: status ----------
+
+app.get("/api/status", (req, res) => {
   res.json({
-    configured: configured(),
-    authenticated: Boolean(req.session?.authenticated),
-    username: req.session?.username || null,
+    configured: validateGitHubConfig(),
+    authenticated: isAuthenticated(req),
+    username: isAuthenticated(req) ? req.session.username : null,
     isAdmin: isAdmin(req),
-  })
-})
+    accessiblePageIds: accessiblePageIds(req),
+  });
+});
 
-// เข้าสู่ระบบ
-app.post('/api/login', (req, res) => {
-  if (!configured()) {
-    return res.status(503).json({
-      error: 'เซิร์ฟเวอร์ยังตั้งค่าไม่ครบ กรุณาตรวจ Environment Variables บน Render',
-    })
+// ---------- API: login ----------
+
+app.post("/api/login", (req, res, next) => {
+  const username = String(req.body?.username || "");
+  const password = String(req.body?.password || "");
+
+  if (!username || !password) {
+    return res.status(400).json({
+      error: "กรุณากรอกชื่อบัญชีและรหัสผ่าน",
+    });
   }
 
-  const username = String(req.body?.username || '').trim()
-  const password = String(req.body?.password || '')
+  let valid = false;
 
-  const user = users().find(
-    (u) => u.username === username && u.password === password
-  )
+  for (let slot = 1; slot <= 5; slot++) {
+    const expectedUsername = process.env[`USER_${slot}_USERNAME`];
+    const expectedPassword = process.env[`USER_${slot}_PASSWORD`];
 
-  if (!user) {
+    if (
+      expectedUsername &&
+      expectedPassword &&
+      username === expectedUsername &&
+      password === expectedPassword
+    ) {
+      valid = true;
+      break;
+    }
+  }
+
+  if (!valid) {
     return res.status(401).json({
-      error: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',
-    })
+      error: "ชื่อบัญชีหรือรหัสผ่านไม่ถูกต้อง",
+    });
   }
 
   req.session.regenerate((err) => {
-    if (err) {
-      return res.status(500).json({
-        error: 'สร้างเซสชันเข้าสู่ระบบไม่สำเร็จ',
-      })
-    }
+    if (err) return next(err);
 
-    req.session.authenticated = true
-    req.session.username = user.username
+    req.session.authenticated = true;
+    req.session.username = username;
 
-    req.session.save((saveError) => {
-      if (saveError) {
-        return res.status(500).json({
-          error: 'บันทึกเซสชันไม่สำเร็จ',
-        })
-      }
+    req.session.save((saveErr) => {
+      if (saveErr) return next(saveErr);
 
       res.json({
-        ok: true,
-        username: user.username,
-        isAdmin: Boolean(
-          process.env.ADMIN_USERNAME &&
-          user.username === process.env.ADMIN_USERNAME
-        ),
-      })
-    })
-  })
-})
+        success: true,
+        username,
+        isAdmin: isAdmin(req),
+        accessiblePageIds: accessiblePageIds(req),
+      });
+    });
+  });
+});
 
-// ออกจากระบบ
-app.post('/api/logout', (req, res) => {
+// ---------- API: logout ----------
+
+app.post("/api/logout", (req, res, next) => {
   req.session.destroy((err) => {
-    if (err) {
-      return res.status(500).json({
-        error: 'ออกจากระบบไม่สำเร็จ',
-      })
-    }
+    if (err) return next(err);
 
-    res.clearCookie('pixel_manager_session')
-    res.json({ ok: true })
-  })
-})
+    res.clearCookie("pixel_manager_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "none",
+    });
 
-// โหลด Pixel ID จาก GitHub
+    res.json({ success: true });
+  });
+});
+
+// ---------- API: read Pixel IDs ----------
+
 app.get(
-  '/api/pages/:id',
+  "/api/pages/:id",
   requireAuth,
   requirePageAccess,
-  async (req, res) => {
+  async (req, res, next) => {
     try {
-      const page = pageById(req.params.id)
-      const gh = await getGitHubClient()
+      const page = req.salesPage;
+      const octokit = await getGitHubClient();
 
-      const response = await gh.request(
-        'GET /repos/{owner}/{repo}/contents/{path}',
-        {
-          owner: page.owner,
-          repo: page.repo,
-          path: page.path,
-          ref: page.branch,
-        }
-      )
+      const response = await octokit.repos.getContent({
+        owner: page.owner,
+        repo: page.repo,
+        path: page.path,
+        ref: page.branch,
+      });
 
-      const data = response.data
-
-      if (Array.isArray(data) || !data.content || data.type !== 'file') {
-        throw new Error('ปลายทางไม่ใช่ไฟล์ หรือไฟล์ไม่มีเนื้อหา')
+      if (Array.isArray(response.data) || !response.data.content) {
+        return res.status(400).json({
+          error: "พาธนี้ไม่ได้ชี้ไปยังไฟล์ HTML",
+        });
       }
 
-      const html = Buffer.from(data.content, 'base64').toString('utf8')
-      const ids = parseIds(html)
+      const html = Buffer.from(
+        response.data.content,
+        "base64"
+      ).toString("utf8");
 
       res.json({
-        ids,
-        sha: data.sha,
-      })
-    } catch (error) {
-      console.error('โหลด Pixel ID ไม่สำเร็จ:', error)
-
-      res.status(error.status || 400).json({
-        error: error.message || 'โหลด Pixel ID ไม่สำเร็จ',
-      })
+        id: page.id,
+        name: page.name,
+        pixelIds: extractPixelIds(html),
+      });
+    } catch (err) {
+      next(err);
     }
   }
-)
+);
 
-// บันทึก Pixel ID และ Commit กลับ GitHub
+// ---------- API: commit Pixel IDs ----------
+
 app.post(
-  '/api/pages/:id/commit',
+  "/api/pages/:id/commit",
   requireAuth,
   requirePageAccess,
-  async (req, res) => {
+  async (req, res, next) => {
     try {
-      const page = pageById(req.params.id)
-      const ids = req.body?.ids
+      const page = req.salesPage;
+      const pixelIds = normalizePixelIds(req.body?.pixelIds);
 
-      if (
-        !Array.isArray(ids) ||
-        !ids.length ||
-        ids.some((id) => !/^\d{5,25}$/.test(String(id))) ||
-        new Set(ids.map(String)).size !== ids.length
-      ) {
+      if (pixelIds.length === 0) {
         return res.status(400).json({
-          error: 'Pixel ID ต้องเป็นตัวเลข 5–25 หลัก ไม่ซ้ำกัน และต้องมีอย่างน้อยหนึ่งรายการ',
-        })
+          error: "กรุณาระบุ Pixel ID อย่างน้อยหนึ่งรายการ",
+        });
       }
 
-      const normalizedIds = ids.map(String)
-      const gh = await getGitHubClient()
+      const octokit = await getGitHubClient();
 
-      const response = await gh.request(
-        'GET /repos/{owner}/{repo}/contents/{path}',
-        {
-          owner: page.owner,
-          repo: page.repo,
-          path: page.path,
-          ref: page.branch,
-        }
-      )
+      const current = await octokit.repos.getContent({
+        owner: page.owner,
+        repo: page.repo,
+        path: page.path,
+        ref: page.branch,
+      });
 
-      const file = response.data
-
-      if (Array.isArray(file) || !file.content || file.type !== 'file') {
-        throw new Error('อ่านไฟล์ HTML ไม่สำเร็จ')
-      }
-
-      const original = Buffer.from(file.content, 'base64').toString('utf8')
-      const updated = rewritePixelIds(original, normalizedIds)
-
-      if (updated === original) {
+      if (Array.isArray(current.data) || !current.data.content) {
         return res.status(400).json({
-          error: 'ไม่มีการเปลี่ยนแปลงจากค่าเดิม',
-        })
+          error: "พาธนี้ไม่ได้ชี้ไปยังไฟล์ HTML",
+        });
       }
 
-      const commitResponse = await gh.request(
-        'PUT /repos/{owner}/{repo}/contents/{path}',
-        {
-          owner: page.owner,
-          repo: page.repo,
-          path: page.path,
-          message: String(
-            req.body?.message ||
-            `Update Facebook Pixel IDs (${normalizedIds.length})`
-          ).slice(0, 120),
-          content: Buffer.from(updated, 'utf8').toString('base64'),
-          sha: file.sha,
-          branch: page.branch,
-        }
-      )
+      const oldHtml = Buffer.from(
+        current.data.content,
+        "base64"
+      ).toString("utf8");
+
+      const newHtml = replacePixelIds(oldHtml, pixelIds);
+
+      if (newHtml === oldHtml) {
+        return res.json({
+          success: true,
+          message: "ไม่มีการเปลี่ยนแปลง",
+          pixelIds,
+        });
+      }
+
+      const result = await octokit.repos.createOrUpdateFileContents({
+        owner: page.owner,
+        repo: page.repo,
+        path: page.path,
+        branch: page.branch,
+        sha: current.data.sha,
+        message: `Update Facebook Pixel IDs for ${page.name}`,
+        content: Buffer.from(newHtml, "utf8").toString("base64"),
+      });
 
       res.json({
-        ok: true,
-        commitUrl: commitResponse.data.commit.html_url,
-        ids: normalizedIds.length,
-      })
-    } catch (error) {
-      console.error('Commit Pixel ID ไม่สำเร็จ:', error)
-
-      res.status(error.status || 400).json({
-        error: error.message || 'Commit ไม่สำเร็จ',
-      })
+        success: true,
+        message: "Commit สำเร็จ",
+        commitUrl: result.data.commit.html_url,
+        pixelIds,
+      });
+    } catch (err) {
+      next(err);
     }
   }
-)
+);
 
-// เสิร์ฟหน้าเว็บ React ที่ build แล้ว
-app.use(express.static(path.join(__dirname, 'dist')))
+// ---------- Error handler ----------
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'))
-})
+app.use((err, req, res, next) => {
+  console.error("API error:", err.message);
 
-app.listen(port, () => {
-  console.log(`Pixel Control listening on :${port}`)
-})
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  res.status(500).json({
+    error: "เกิดข้อผิดพลาดในระบบ กรุณาตรวจสอบการตั้งค่า Backend",
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Pixel Manager API listening on port ${PORT}`);
+});
