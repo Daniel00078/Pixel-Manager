@@ -38,4 +38,14 @@ export const SALES_PAGES = [
     path: 'index.html',
     currentPixelId: 'ใส่ Pixel ID ปัจจุบันถ้าทราบ',
   },
+  {
+    id: 'Sales Page 04',
+    name: 'TK',
+    description: 'หน้าเซลเพจสำรอง',
+    owner: 'Daniel00078',
+    repo: 'Pd',
+    branch: 'main',
+    path: 'index.html',
+    currentPixelId: 'ใส่ Pixel ID ปัจจุบันถ้าทราบ',
+  },
 ]
