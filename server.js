@@ -1,3 +1,4 @@
+
 import 'dotenv/config'
 import express from 'express'
 import path from 'node:path'
@@ -49,6 +50,14 @@ const users = () =>
     password: process.env[`USER_${i + 1}_PASSWORD`],
   })).filter((u) => u.username && u.password)
 
+// ตรวจสอบว่าเป็นแอดมินหรือไม่
+const isAdmin = (req) => Boolean(
+  req.session?.authenticated &&
+  req.session?.username &&
+  process.env.ADMIN_USERNAME &&
+  req.session.username === process.env.ADMIN_USERNAME
+)
+
 // สร้าง GitHub App
 const githubApp = () => {
   const appId = process.env.GITHUB_APP_ID
@@ -56,16 +65,18 @@ const githubApp = () => {
     ?.replace(/\\n/g, '\n')
   const installationId = Number(process.env.GITHUB_INSTALLATION_ID)
 
-  if (!appId || !privateKey || !Number.isSafeInteger(installationId) || installationId <= 0) {
+  if (
+    !appId ||
+    !privateKey ||
+    !Number.isSafeInteger(installationId) ||
+    installationId <= 0
+  ) {
     throw new Error(
       'การตั้งค่า GitHub App ไม่ครบ กรุณาตรวจ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY และ GITHUB_INSTALLATION_ID'
     )
   }
 
-  return new GitHubApp({
-    appId,
-    privateKey,
-  })
+  return new GitHubApp({ appId, privateKey })
 }
 
 const getGitHubClient = async () => {
@@ -78,7 +89,7 @@ const getGitHubClient = async () => {
   return githubApp().getInstallationOctokit(installationId)
 }
 
-// ตรวจสอบการตั้งค่า Repository
+// ค้นหาเซลเพจที่ตั้งค่า Repository ถูกต้อง
 const pageById = (id) =>
   SALES_PAGES.find(
     (page) =>
@@ -91,112 +102,123 @@ const pageById = (id) =>
       !page.repo.startsWith('YOUR_')
   )
 
-const requireAuth = (req, res, next) =>
-  req.session?.authenticated
-    ? next()
-    : res.status(401).json({
-        error: 'กรุณาเข้าสู่ระบบผู้ดูแลก่อนใช้งาน',
-      })
+// ตรวจสอบการเข้าสู่ระบบ
+const requireAuth = (req, res, next) => {
+  if (!req.session?.authenticated) {
+    return res.status(401).json({
+      error: 'กรุณาเข้าสู่ระบบก่อนใช้งาน',
+    })
+  }
 
-// แปลงข้อความ HTML เป็น Pixel ID
+  next()
+}
+
+// ตรวจสอบสิทธิ์ของเซลเพจ
+const requirePageAccess = (req, res, next) => {
+  const page = pageById(req.params.id)
+
+  if (!page) {
+    return res.status(404).json({
+      error: 'ไม่พบเซลเพจ หรือยังไม่ได้ตั้งค่า Repository ใน src/config.js',
+    })
+  }
+
+  // หน้า adminOnly ต้องเป็นแอดมินเท่านั้น
+  if (page.adminOnly && !isAdmin(req)) {
+    return res.status(403).json({
+      error: 'เซลเพจนี้อนุญาตให้แอดมินใช้งานเท่านั้น',
+    })
+  }
+
+  next()
+}
+
+// แปลง HTML เป็นรายการ Pixel ID
 function parseIds(html) {
   const init = [
     ...html.matchAll(
-      /(?:window\.)?fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/gi
+      /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]\s*\)/gi
     ),
   ].map((m) => m[1])
 
   const noscript = [
     ...html.matchAll(
-      /<img\b(?=[^>]*facebook\.com\/tr\?id=)(?=[^>]*noscript=1)[^>]*>/gi
+      /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])(?=[^>]*\bnoscript=1)[^>]*>/gi
     ),
   ]
     .map((m) => m[0].match(/[?&]id=(\d+)/i)?.[1])
     .filter(Boolean)
 
-  if (!init.length && !noscript.length) {
+  const ids = [...new Set([...init, ...noscript])]
+
+  if (!ids.length) {
     throw new Error(
-      'ไม่พบ Facebook Pixel ใน fbq init หรือ noscript กรุณาตรวจรูปแบบในไฟล์ HTML'
+      'ไม่พบ Facebook Pixel ในไฟล์ HTML กรุณาตรวจรูปแบบ fbq init หรือ noscript'
     )
   }
 
-  // ใช้ลำดับจาก fbq init ก่อน แล้วรวม ID ที่พบเฉพาะใน noscript
-  return [...new Set([...init, ...noscript])]
+  return ids
 }
 
-// แทนที่ Pixel ID ใน fbq init และ noscript
+// แทนที่ Pixel ID โดยรักษาโค้ด HTML ส่วนอื่นไว้
 function rewritePixelIds(html, ids) {
   const initRegex =
-    /(?:window\.)?fbq\s*\(\s*['"]init['"]\s*,\s*['"]\d+['"]\s*\)\s*;?/gi
+    /fbq\s*\(\s*['"]init['"]\s*,\s*['"]\d+['"]\s*\)\s*;?/gi
 
   const imgRegex =
-    /<img\b(?=[^>]*facebook\.com\/tr\?id=)(?=[^>]*noscript=1)[^>]*>/gi
+    /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])(?=[^>]*\bnoscript=1)[^>]*>/gi
 
-  const initMatches = [...html.matchAll(initRegex)]
-  const imgMatches = [...html.matchAll(imgRegex)]
+  let initCount = 0
 
-  if (!initMatches.length) {
+  let result = html.replace(initRegex, () => {
+    initCount++
+
+    // ใส่รายการใหม่ ณ ตำแหน่งแรก ลบ init เก่าที่เหลือ
+    if (initCount === 1) {
+      return ids.map((id) => `fbq('init', '${id}');`).join('\n    ')
+    }
+
+    return ''
+  })
+
+  if (initCount === 0) {
     throw new Error('ไม่พบ fbq init ในไฟล์ HTML จึงหยุดการบันทึก')
   }
 
-  if (!imgMatches.length) {
-    throw new Error('ไม่พบ Facebook Pixel noscript ในไฟล์ HTML จึงหยุดการบันทึก')
-  }
+  // อัปเดต noscript หากมีอยู่ในไฟล์
+  let imgCount = 0
 
-  // สร้างส่วน fbq init ตามรายการ ID ใหม่
-  function rebuildInit(source, matches, values) {
-    const firstIndex = matches[0].index
-    const lastMatch = matches[matches.length - 1]
-    const lastEnd = lastMatch.index + lastMatch[0].length
+  result = result.replace(imgRegex, (img) => {
+    imgCount++
 
-    const before = source.slice(0, firstIndex)
-    const after = source.slice(lastEnd)
+    if (imgCount > 1) {
+      return ''
+    }
 
-    const replacement = values
-      .map((id) => `fbq('init', '${id}');`)
-      .join('\n    ')
+    const updatedImages = ids.map((id) => {
+      if (!/[?&]id=\d+/i.test(img)) {
+        throw new Error('ไม่พบ Pixel ID ใน URL ของ noscript')
+      }
 
-    return before + replacement + after
-  }
-
-  // สร้างส่วน noscript ตามรายการ ID ใหม่
-  function rebuildNoscript(source, matches, values) {
-    const firstIndex = matches[0].index
-    const lastMatch = matches[matches.length - 1]
-    const lastEnd = lastMatch.index + lastMatch[0].length
-
-    const before = source.slice(0, firstIndex)
-    const after = source.slice(lastEnd)
-
-    const replacement = values
-      .map((id) =>
-        lastMatch[0].replace(
-          /([?&]id=)\d+/i,
-          (_match, prefix) => `${prefix}${id}`
-        )
+      return img.replace(
+        /([?&]id=)\d+/i,
+        (_, prefix) => `${prefix}${id}`
       )
-      .join('\n')
+    })
 
-    return before + replacement + after
-  }
-
-  let result = rebuildInit(html, initMatches, ids)
-  const updatedImgMatches = [...result.matchAll(imgRegex)]
-
-  if (!updatedImgMatches.length) {
-    throw new Error('ไม่พบ noscript หลังประมวลผล fbq init')
-  }
-
-  result = rebuildNoscript(result, updatedImgMatches, ids)
+    return updatedImages.join('\n')
+  })
 
   return result
 }
 
-// อ่านข้อมูลสถานะ
+// สถานะระบบ
 app.get('/api/status', (req, res) => {
   res.json({
     configured: configured(),
     authenticated: Boolean(req.session?.authenticated),
+    username: req.session?.username || null,
+    isAdmin: isAdmin(req),
   })
 })
 
@@ -221,12 +243,32 @@ app.post('/api/login', (req, res) => {
     })
   }
 
-  req.session.authenticated = true
-  req.session.username = user.username
+  req.session.regenerate((err) => {
+    if (err) {
+      return res.status(500).json({
+        error: 'สร้างเซสชันเข้าสู่ระบบไม่สำเร็จ',
+      })
+    }
 
-  res.json({
-    ok: true,
-    username: user.username,
+    req.session.authenticated = true
+    req.session.username = user.username
+
+    req.session.save((saveError) => {
+      if (saveError) {
+        return res.status(500).json({
+          error: 'บันทึกเซสชันไม่สำเร็จ',
+        })
+      }
+
+      res.json({
+        ok: true,
+        username: user.username,
+        isAdmin: Boolean(
+          process.env.ADMIN_USERNAME &&
+          user.username === process.env.ADMIN_USERNAME
+        ),
+      })
+    })
   })
 })
 
@@ -245,130 +287,127 @@ app.post('/api/logout', (req, res) => {
 })
 
 // โหลด Pixel ID จาก GitHub
-app.get('/api/pages/:id', requireAuth, async (req, res) => {
-  try {
-    const page = pageById(req.params.id)
+app.get(
+  '/api/pages/:id',
+  requireAuth,
+  requirePageAccess,
+  async (req, res) => {
+    try {
+      const page = pageById(req.params.id)
+      const gh = await getGitHubClient()
 
-    if (!page) {
-      return res.status(404).json({
-        error: 'ไม่พบเซลเพจ หรือยังไม่ได้ตั้งค่า Repository ใน src/config.js',
+      const response = await gh.request(
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        {
+          owner: page.owner,
+          repo: page.repo,
+          path: page.path,
+          ref: page.branch,
+        }
+      )
+
+      const data = response.data
+
+      if (Array.isArray(data) || !data.content || data.type !== 'file') {
+        throw new Error('ปลายทางไม่ใช่ไฟล์ หรือไฟล์ไม่มีเนื้อหา')
+      }
+
+      const html = Buffer.from(data.content, 'base64').toString('utf8')
+      const ids = parseIds(html)
+
+      res.json({
+        ids,
+        sha: data.sha,
+      })
+    } catch (error) {
+      console.error('โหลด Pixel ID ไม่สำเร็จ:', error)
+
+      res.status(error.status || 400).json({
+        error: error.message || 'โหลด Pixel ID ไม่สำเร็จ',
       })
     }
-
-    const gh = await getGitHubClient()
-
-    const response = await gh.request(
-      'GET /repos/{owner}/{repo}/contents/{path}',
-      {
-        owner: page.owner,
-        repo: page.repo,
-        path: page.path,
-        ref: page.branch,
-      }
-    )
-
-    const data = response.data
-
-    if (Array.isArray(data) || !data.content || data.type !== 'file') {
-      throw new Error('ปลายทางไม่ใช่ไฟล์ หรือไฟล์ไม่มีเนื้อหา')
-    }
-
-    const html = Buffer.from(data.content, 'base64').toString('utf8')
-    const ids = parseIds(html)
-
-    res.json({
-      ids,
-      sha: data.sha,
-    })
-  } catch (error) {
-    console.error('โหลด Pixel ID ไม่สำเร็จ:', error)
-
-    res.status(error.status || 400).json({
-      error: error.message || 'โหลด Pixel ID ไม่สำเร็จ',
-    })
   }
-})
+)
 
 // บันทึก Pixel ID และ Commit กลับ GitHub
-app.post('/api/pages/:id/commit', requireAuth, async (req, res) => {
-  try {
-    const page = pageById(req.params.id)
+app.post(
+  '/api/pages/:id/commit',
+  requireAuth,
+  requirePageAccess,
+  async (req, res) => {
+    try {
+      const page = pageById(req.params.id)
+      const ids = req.body?.ids
 
-    if (!page) {
-      return res.status(404).json({
-        error: 'ไม่พบเซลเพจ หรือยังไม่ได้ตั้งค่า Repository ใน src/config.js',
-      })
-    }
-
-    const ids = req.body?.ids
-
-    if (
-      !Array.isArray(ids) ||
-      !ids.length ||
-      ids.some((id) => !/^\d{5,25}$/.test(String(id))) ||
-      new Set(ids.map(String)).size !== ids.length
-    ) {
-      return res.status(400).json({
-        error: 'Pixel ID ต้องเป็นตัวเลข 5–25 หลัก ไม่ซ้ำกัน และต้องมีอย่างน้อยหนึ่งรายการ',
-      })
-    }
-
-    const gh = await getGitHubClient()
-
-    // อ่านไฟล์เดิมเพื่อรับ SHA สำหรับ Commit
-    const response = await gh.request(
-      'GET /repos/{owner}/{repo}/contents/{path}',
-      {
-        owner: page.owner,
-        repo: page.repo,
-        path: page.path,
-        ref: page.branch,
+      if (
+        !Array.isArray(ids) ||
+        !ids.length ||
+        ids.some((id) => !/^\d{5,25}$/.test(String(id))) ||
+        new Set(ids.map(String)).size !== ids.length
+      ) {
+        return res.status(400).json({
+          error: 'Pixel ID ต้องเป็นตัวเลข 5–25 หลัก ไม่ซ้ำกัน และต้องมีอย่างน้อยหนึ่งรายการ',
+        })
       }
-    )
 
-    const file = response.data
+      const normalizedIds = ids.map(String)
+      const gh = await getGitHubClient()
 
-    if (Array.isArray(file) || !file.content || file.type !== 'file') {
-      throw new Error('อ่านไฟล์ HTML ไม่สำเร็จ')
-    }
+      const response = await gh.request(
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        {
+          owner: page.owner,
+          repo: page.repo,
+          path: page.path,
+          ref: page.branch,
+        }
+      )
 
-    const original = Buffer.from(file.content, 'base64').toString('utf8')
-    const updated = rewritePixelIds(original, ids.map(String))
+      const file = response.data
 
-    if (updated === original) {
-      return res.status(400).json({
-        error: 'ไม่มีการเปลี่ยนแปลงจากค่าเดิม',
+      if (Array.isArray(file) || !file.content || file.type !== 'file') {
+        throw new Error('อ่านไฟล์ HTML ไม่สำเร็จ')
+      }
+
+      const original = Buffer.from(file.content, 'base64').toString('utf8')
+      const updated = rewritePixelIds(original, normalizedIds)
+
+      if (updated === original) {
+        return res.status(400).json({
+          error: 'ไม่มีการเปลี่ยนแปลงจากค่าเดิม',
+        })
+      }
+
+      const commitResponse = await gh.request(
+        'PUT /repos/{owner}/{repo}/contents/{path}',
+        {
+          owner: page.owner,
+          repo: page.repo,
+          path: page.path,
+          message: String(
+            req.body?.message ||
+            `Update Facebook Pixel IDs (${normalizedIds.length})`
+          ).slice(0, 120),
+          content: Buffer.from(updated, 'utf8').toString('base64'),
+          sha: file.sha,
+          branch: page.branch,
+        }
+      )
+
+      res.json({
+        ok: true,
+        commitUrl: commitResponse.data.commit.html_url,
+        ids: normalizedIds.length,
+      })
+    } catch (error) {
+      console.error('Commit Pixel ID ไม่สำเร็จ:', error)
+
+      res.status(error.status || 400).json({
+        error: error.message || 'Commit ไม่สำเร็จ',
       })
     }
-
-    const commitResponse = await gh.request(
-      'PUT /repos/{owner}/{repo}/contents/{path}',
-      {
-        owner: page.owner,
-        repo: page.repo,
-        path: page.path,
-        message: String(
-          req.body?.message || `Update Facebook Pixel IDs (${ids.length})`
-        ).slice(0, 120),
-        content: Buffer.from(updated, 'utf8').toString('base64'),
-        sha: file.sha,
-        branch: page.branch,
-      }
-    )
-
-    res.json({
-      ok: true,
-      commitUrl: commitResponse.data.commit.html_url,
-      ids: ids.length,
-    })
-  } catch (error) {
-    console.error('Commit Pixel ID ไม่สำเร็จ:', error)
-
-    res.status(error.status || 400).json({
-      error: error.message || 'Commit ไม่สำเร็จ',
-    })
   }
-})
+)
 
 // เสิร์ฟหน้าเว็บ React ที่ build แล้ว
 app.use(express.static(path.join(__dirname, 'dist')))
