@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+
+import React, { useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   Activity,
@@ -43,7 +44,9 @@ async function api(url, options = {}) {
 }
 
 function App() {
-  const [selectedId, setSelectedId] = useState('')
+  const [selectedId, setSelectedId] = useState(
+    SALES_PAGES.find((page) => !page.adminOnly)?.id ?? ''
+  )
 
   const [pixelRows, setPixelRows] = useState([])
   const [status, setStatus] = useState({ type: 'idle', message: '' })
@@ -57,21 +60,18 @@ function App() {
   const [authenticated, setAuthenticated] = useState(false)
   const [isAdmin, setIsAdmin] = useState(false)
   const [serverConfigured, setServerConfigured] = useState(false)
-  const [currentUsername, setCurrentUsername] = useState('')
-  const [accessiblePageIds, setAccessiblePageIds] = useState([])
 
-  // แยกข้อมูลฟอร์มล็อกอินออกจากผู้ใช้ที่ล็อกอินแล้ว
-  const [loginUsername, setLoginUsername] = useState('')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
 
-  // ใช้รายการสิทธิ์จาก Backend เป็นหลัก
-  const visiblePages = useMemo(() => {
-    if (!authenticated) return []
-
-    return SALES_PAGES.filter((page) =>
-      accessiblePageIds.includes(page.id)
-    )
-  }, [authenticated, accessiblePageIds])
+  // กรองหน้า adminOnly ออกจากรายการของผู้ใช้ทั่วไป
+  const visiblePages = useMemo(
+    () =>
+      SALES_PAGES.filter(
+        (page) => !page.adminOnly || (authenticated && isAdmin)
+      ),
+    [authenticated, isAdmin]
+  )
 
   const selected = useMemo(
     () => visiblePages.find((page) => page.id === selectedId),
@@ -93,66 +93,41 @@ function App() {
     pixelRows.every((row) => /^\d{5,25}$/.test(row.value.trim())) &&
     new Set(desiredPixelIds).size === desiredPixelIds.length
 
-  // อ่านสถานะการล็อกอินและสิทธิ์จาก Backend
-  const refreshAuth = useCallback(async () => {
+  // อ่านสถานะและสิทธิ์จากเซิร์ฟเวอร์
+  async function refreshAuth() {
     try {
       const data = await api('/api/status')
 
-      const loggedIn = Boolean(data.authenticated)
-
       setServerConfigured(Boolean(data.configured))
-      setAuthenticated(loggedIn)
-      setIsAdmin(Boolean(loggedIn && data.isAdmin))
-      setCurrentUsername(loggedIn ? data.username || '' : '')
-      setAccessiblePageIds(
-        loggedIn && Array.isArray(data.accessiblePageIds)
-          ? data.accessiblePageIds
-          : []
-      )
+      setAuthenticated(Boolean(data.authenticated))
+      setIsAdmin(Boolean(data.authenticated && data.isAdmin))
 
-      if (!loggedIn) {
+      if (!data.authenticated) {
         setPixelRows([])
-        setSelectedId('')
       }
     } catch {
       setServerConfigured(false)
       setAuthenticated(false)
       setIsAdmin(false)
-      setCurrentUsername('')
-      setAccessiblePageIds([])
       setPixelRows([])
-      setSelectedId('')
     }
-  }, [])
+  }
 
   // ล็อกอิน
   async function login(e) {
     e?.preventDefault()
 
     setBusy(true)
-    setStatus({ type: 'idle', message: '' })
 
     try {
       const data = await api('/api/login', {
         method: 'POST',
-        body: JSON.stringify({
-          username: loginUsername.trim(),
-          password,
-        }),
+        body: JSON.stringify({ username, password }),
       })
-
-      const pageIds = Array.isArray(data.accessiblePageIds)
-        ? data.accessiblePageIds
-        : []
 
       setPassword('')
       setAuthenticated(true)
-      setCurrentUsername(data.username || loginUsername.trim())
       setIsAdmin(Boolean(data.isAdmin))
-      setAccessiblePageIds(pageIds)
-      setSelectedId(pageIds[0] || '')
-      setPixelRows([])
-      setCommitUrl('')
 
       setStatus({
         type: 'success',
@@ -160,9 +135,6 @@ function App() {
           ? 'เข้าสู่ระบบแอดมินสำเร็จ'
           : 'เข้าสู่ระบบสำเร็จ',
       })
-
-      // ตรวจสอบสิทธิ์ล่าสุดจากเซิร์ฟเวอร์อีกครั้ง
-      await refreshAuth()
     } catch (error) {
       setStatus({ type: 'error', message: error.message })
     } finally {
@@ -172,90 +144,85 @@ function App() {
 
   // ออกจากระบบ
   async function logout() {
-    setBusy(true)
-
     try {
       await api('/api/logout', {
         method: 'POST',
         body: '{}',
       })
     } catch {
-      // ล้างสถานะหน้าเว็บแม้ API logout มีปัญหา
+      // ล้างสถานะบนหน้าจอแม้ API ออกจากระบบมีปัญหา
     }
 
     setAuthenticated(false)
     setIsAdmin(false)
-    setCurrentUsername('')
-    setAccessiblePageIds([])
     setPixelRows([])
     setCommitUrl('')
-    setSelectedId('')
-    setLoginUsername('')
-    setPassword('')
-    setBusy(false)
+    setSelectedId(
+      SALES_PAGES.find((page) => !page.adminOnly)?.id ?? ''
+    )
     setStatus({ type: 'idle', message: 'ออกจากระบบแล้ว' })
   }
 
-  // โหลด Pixel IDs จาก GitHub
-  const loadCurrentPixelIds = useCallback(
-    async (pageId = selectedId) => {
-      if (!authenticated || !pageId) return
+  // โหลด Pixel ID จาก GitHub
+  async function loadCurrentPixelIds(pageId = selectedId) {
+    if (!authenticated || !pageId) return
 
-      // ป้องกันการโหลดหน้าเว็บที่ไม่ได้อยู่ในสิทธิ์ปัจจุบัน
-      if (!accessiblePageIds.includes(pageId)) {
-        setPixelRows([])
-        setStatus({
-          type: 'error',
-          message: 'บัญชีของคุณไม่มีสิทธิ์เข้าถึงเซลเพจนี้',
-        })
-        return
-      }
+    const page = SALES_PAGES.find((item) => item.id === pageId)
 
-      setBusy(true)
+    // ป้องกันไม่ให้หน้าเว็บพยายามโหลดหน้าที่ไม่มีสิทธิ์
+    if (page?.adminOnly && !isAdmin) {
+      setPixelRows([])
       setStatus({
-        type: 'working',
-        message: 'กำลังโหลด Pixel ID เดิมจาก GitHub…',
+        type: 'error',
+        message: 'เซลเพจนี้อนุญาตให้แอดมินใช้งานเท่านั้น',
       })
+      return
+    }
 
-      try {
-        const data = await api(
-          `/api/pages/${encodeURIComponent(pageId)}`
-        )
+    setBusy(true)
+    setStatus({
+      type: 'working',
+      message: 'กำลังโหลด Pixel ID เดิมจาก GitHub…',
+    })
 
-        // รองรับทั้ง API รูปแบบเดิมที่ใช้ ids และรูปแบบ pixelIds
-        const ids = Array.isArray(data.ids)
-          ? data.ids
-          : Array.isArray(data.pixelIds)
-            ? data.pixelIds
-            : []
+    try {
+      const data = await api(
+        `/api/pages/${encodeURIComponent(pageId)}`
+      )
 
-        setPixelRows(
-          ids.map((value, index) => ({
-            key: `${Date.now()}-${index}-${Math.random()}`,
-            value: String(value),
-          }))
-        )
+      setPixelRows(
+        data.ids.map((value, index) => ({
+          key: `${Date.now()}-${index}-${Math.random()}`,
+          value,
+        }))
+      )
 
-        setStatus({
-          type: 'success',
-          message: `โหลด Pixel ID เดิม ${ids.length} รายการแล้ว`,
-        })
-      } catch (error) {
-        setPixelRows([])
-        setStatus({ type: 'error', message: error.message })
-      } finally {
-        setBusy(false)
-      }
-    },
-    [authenticated, accessiblePageIds, selectedId]
-  )
+      setStatus({
+        type: 'success',
+        message: `โหลด Pixel ID เดิม ${data.ids.length} รายการแล้ว`,
+      })
+    } catch (error) {
+      setPixelRows([])
+      setStatus({ type: 'error', message: error.message })
+    } finally {
+      setBusy(false)
+    }
+  }
 
-  // บันทึก Pixel IDs และ Commit กลับ GitHub
+  // บันทึก Pixel ID และ Commit กลับ GitHub
   async function commitPixel() {
-    if (!selected || !accessiblePageIds.includes(selected.id)) {
+    if (!selected) {
       setStatus({
         type: 'error',
         message: 'กรุณาเลือกเซลเพจที่คุณมีสิทธิ์ใช้งาน',
+      })
+      return
+    }
+
+    if (selected.adminOnly && !isAdmin) {
+      setStatus({
+        type: 'error',
+        message: 'เซลเพจนี้อนุญาตให้แอดมินใช้งานเท่านั้น',
       })
       return
     }
@@ -278,7 +245,7 @@ function App() {
 
     try {
       const data = await api(
-        `/api/pages/${encodeURIComponent(selected.id)}/commit`,
+        `/api/pages/${encodeURIComponent(selectedId)}/commit`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -288,20 +255,14 @@ function App() {
         }
       )
 
-      setCommitUrl(data.commitUrl || '')
-
-      const syncedCount = Array.isArray(data.ids)
-        ? data.ids.length
-        : typeof data.ids === 'number'
-          ? data.ids
-          : desiredPixelIds.length
+      setCommitUrl(data.commitUrl)
 
       setStatus({
         type: 'success',
-        message: `Commit สำเร็จ ซิงก์ ${syncedCount} Pixel ID แล้ว`,
+        message: `Commit สำเร็จ ซิงก์ ${data.ids} Pixel ID แล้ว`,
       })
 
-      await loadCurrentPixelIds(selected.id)
+      await loadCurrentPixelIds(selectedId)
     } catch (error) {
       setStatus({ type: 'error', message: error.message })
     } finally {
@@ -309,14 +270,14 @@ function App() {
     }
   }
 
-  // ตรวจสอบเซสชันเมื่อเปิดเว็บ
+  // ตรวจสอบสถานะเซสชันเมื่อเปิดหน้าเว็บ
   useEffect(() => {
     refreshAuth()
-  }, [refreshAuth])
+  }, [])
 
-  // เลือกหน้าแรกที่ได้รับอนุญาตโดยอัตโนมัติ
+  // หากเลือกหน้า adminOnly อยู่ แต่ไม่มีสิทธิ์ ให้เปลี่ยนหน้า
   useEffect(() => {
-    if (!authenticated || visiblePages.length === 0) {
+    if (visiblePages.length === 0) {
       setSelectedId('')
       setPixelRows([])
       setCommitUrl('')
@@ -329,23 +290,16 @@ function App() {
       setCommitUrl('')
       setStatus({ type: 'idle', message: '' })
     }
-  }, [authenticated, visiblePages, selectedId])
+  }, [visiblePages, selectedId])
 
-  // โหลดข้อมูลเมื่อเลือกเซลเพจที่มีสิทธิ์
+  // โหลด Pixel ID เมื่อเข้าสู่ระบบหรือเปลี่ยนเซลเพจ
   useEffect(() => {
-    if (
-      authenticated &&
-      selectedId &&
-      accessiblePageIds.includes(selectedId)
-    ) {
+    if (authenticated && selectedId && selected) {
       loadCurrentPixelIds(selectedId)
     }
-  }, [
-    authenticated,
-    selectedId,
-    accessiblePageIds,
-    loadCurrentPixelIds,
-  ])
+    // loadCurrentPixelIds ใช้ selectedId และสิทธิ์ปัจจุบัน
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticated, selectedId, isAdmin])
 
   return (
     <div className="app-shell">
@@ -368,6 +322,7 @@ function App() {
           Pixel Manager
           <span className="nav-dot" />
         </div>
+
 
         <div className="sidebar-bottom">
           <div className="connection-dot" />
@@ -403,7 +358,6 @@ function App() {
                 className="icon-button"
                 onClick={logout}
                 title="ออกจากระบบ"
-                disabled={busy}
               >
                 <LogOut size={16} />
               </button>
@@ -422,6 +376,7 @@ function App() {
             <h1>
               Pixel <span>Manager</span>
             </h1>
+          
           </div>
           <div className="heading-icon">
             <Activity size={30} />
@@ -478,8 +433,8 @@ function App() {
                     id="login-username"
                     autoComplete="username"
                     placeholder="ใส่ชื่อผู้ใช้"
-                    value={loginUsername}
-                    onChange={(e) => setLoginUsername(e.target.value)}
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
                     required
                   />
                 </div>
@@ -528,194 +483,172 @@ function App() {
                     เลือกเซลเพจ <span className="required">*</span>
                   </label>
 
-                  {visiblePages.length > 0 ? (
-                    <div className="select-wrap">
-                      <select
-                        id="page-select"
-                        value={selectedId}
-                        onChange={(e) => {
-                          setSelectedId(e.target.value)
-                          setPixelRows([])
-                          setStatus({ type: 'idle', message: '' })
-                          setCommitUrl('')
-                        }}
-                      >
-                        {visiblePages.map((page) => (
-                          <option key={page.id} value={page.id}>
-                            {page.name}
-                          </option>
-                        ))}
-                      </select>
-                      <ChevronDown size={17} />
-                    </div>
-                  ) : (
-                    <div className="security-details">
-                      บัญชีนี้ยังไม่ได้รับสิทธิ์เข้าถึงเซลเพจใด ๆ
-                      กรุณาติดต่อ Admin
-                    </div>
-                  )}
+                  <div className="select-wrap">
+                    <select
+                      id="page-select"
+                      value={selectedId}
+                      onChange={(e) => {
+                        setSelectedId(e.target.value)
+                        setPixelRows([])
+                        setStatus({ type: 'idle', message: '' })
+                        setCommitUrl('')
+                      }}
+                    >
+                      {visiblePages.map((page) => (
+                        <option key={page.id} value={page.id}>
+                          {page.name}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown size={17} />
+                  </div>
                 </div>
 
-                {selected && (
-                  <>
-                    <div className="field-group">
-                      <label>
-                        รายการ Facebook Pixel ID{' '}
-                        <span className="required">*</span>
-                      </label>
+                <div className="field-group">
+                  <label>
+                    รายการ Facebook Pixel ID{' '}
+                    <span className="required">*</span>
+                  </label>
 
-                      <button
-                        className="load-pixels-button"
-                        type="button"
-                        onClick={() => loadCurrentPixelIds(selected.id)}
-                        disabled={busy}
-                      >
-                        <RefreshCw size={13} />
-                        โหลด Pixel ID เดิมจาก GitHub
-                      </button>
+                  <button
+                    className="load-pixels-button"
+                    type="button"
+                    onClick={() => loadCurrentPixelIds()}
+                    disabled={busy || !selected}
+                  >
+                    <RefreshCw size={13} />
+                    โหลด Pixel ID เดิมจาก GitHub
+                  </button>
 
-                      <div className="pixel-rows">
-                        {pixelRows.length === 0 && (
-                          <div className="pixel-empty">
-                            {busy
-                              ? 'กำลังอ่านไฟล์จาก GitHub…'
-                              : 'ไม่พบรายการที่โหลดได้ กดโหลดอีกครั้งหรือตรวจสอบรูปแบบ Pixel ใน index.html'}
-                          </div>
-                        )}
-
-                        {pixelRows.map((row, index) => (
-                          <div className="pixel-row" key={row.key}>
-                            <div className="pixel-row-number">
-                              {String(index + 1).padStart(2, '0')}
-                            </div>
-
-                            <div className="pixel-row-input">
-                              <label htmlFor={`pixel-row-${row.key}`}>
-                                Pixel ID {index + 1}
-                              </label>
-                              <input
-                                id={`pixel-row-${row.key}`}
-                                inputMode="numeric"
-                                autoComplete="off"
-                                spellCheck="false"
-                                placeholder="ใส่ตัวเลข Pixel ID"
-                                value={row.value}
-                                disabled={busy}
-                                onChange={(e) =>
-                                  setPixelRows((rows) =>
-                                    rows.map((item) =>
-                                      item.key === row.key
-                                        ? {
-                                            ...item,
-                                            value: e.target.value.replace(
-                                              /\D/g,
-                                              ''
-                                            ),
-                                          }
-                                        : item
-                                    )
-                                  )
-                                }
-                              />
-                            </div>
-
-                            <button
-                              className="pixel-remove-button"
-                              type="button"
-                              disabled={busy}
-                              onClick={() =>
-                                setPixelRows((rows) =>
-                                  rows.filter(
-                                    (item) => item.key !== row.key
-                                  )
-                                )
-                              }
-                              aria-label={`ลบ Pixel ID ${index + 1}`}
-                              title="ลบเฉพาะช่องนี้"
-                            >
-                              ลบ
-                            </button>
-                          </div>
-                        ))}
+                  <div className="pixel-rows">
+                    {pixelRows.length === 0 && (
+                      <div className="pixel-empty">
+                        {busy
+                          ? 'กำลังอ่านไฟล์จาก GitHub…'
+                          : 'ไม่พบรายการที่โหลดได้ กดโหลดอีกครั้งหรือตรวจสอบรูปแบบ Pixel ใน index.html'}
                       </div>
+                    )}
 
-                      <div className="pixel-actions">
+                    {pixelRows.map((row, index) => (
+                      <div className="pixel-row" key={row.key}>
+                        <div className="pixel-row-number">
+                          {String(index + 1).padStart(2, '0')}
+                        </div>
+
+                        <div className="pixel-row-input">
+                          <label htmlFor={`pixel-row-${row.key}`}>
+                            Pixel ID {index + 1}
+                          </label>
+                          <input
+                            id={`pixel-row-${row.key}`}
+                            inputMode="numeric"
+                            autoComplete="off"
+                            spellCheck="false"
+                            placeholder="ใส่ตัวเลข Pixel ID"
+                            value={row.value}
+                            onChange={(e) =>
+                              setPixelRows((rows) =>
+                                rows.map((item) =>
+                                  item.key === row.key
+                                    ? {
+                                        ...item,
+                                        value: e.target.value.replace(
+                                          /\D/g,
+                                          ''
+                                        ),
+                                      }
+                                    : item
+                                )
+                              )
+                            }
+                          />
+                        </div>
+
                         <button
-                          className="add-pixel-button"
+                          className="pixel-remove-button"
                           type="button"
                           disabled={busy}
                           onClick={() =>
-                            setPixelRows((rows) => [
-                              ...rows,
-                              {
-                                key: `${Date.now()}-${Math.random()}`,
-                                value: '',
-                              },
-                            ])
+                            setPixelRows((rows) =>
+                              rows.filter((item) => item.key !== row.key)
+                            )
                           }
+                          aria-label={`ลบ Pixel ID ${index + 1}`}
+                          title="ลบเฉพาะช่องนี้"
                         >
-                          + เพิ่มช่อง Pixel ID
+                          ลบ
                         </button>
-
-                        <div className="pixel-list-summary">
-                          {pixelRows.length} ช่อง · แก้ไขหรือลบเฉพาะช่องที่เลือก
-                        </div>
                       </div>
+                    ))}
+                  </div>
 
-                      <div className="field-hint">
-                        <CircleHelp size={14} />
-                        เมื่อ Commit ระบบจะซิงก์ ID ทั้งหมดที่แสดงให้ตรงกันใน
-                        fbq init และ noscript
-                      </div>
-                    </div>
-
-                    <div className="field-group">
-                      <label htmlFor="commit-message">
-                        Commit message
-                      </label>
-                      <div className="input-wrap">
-                        <GitCommitHorizontal size={17} />
-                        <input
-                          id="commit-message"
-                          value={commitMessage}
-                          onChange={(e) =>
-                            setCommitMessage(e.target.value)
-                          }
-                          maxLength={120}
-                          disabled={busy}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="divider" />
-
+                  <div className="pixel-actions">
                     <button
-                      className="commit-button"
-                      disabled={busy || !selected || !pixelIsValid}
-                      onClick={commitPixel}
+                      className="add-pixel-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        setPixelRows((rows) => [
+                          ...rows,
+                          {
+                            key: `${Date.now()}-${Math.random()}`,
+                            value: '',
+                          },
+                        ])
+                      }
                     >
-                      {busy ? (
-                        <RefreshCw className="spin" size={18} />
-                      ) : (
-                        <UploadCloud size={19} />
-                      )}
-                      {busy
-                        ? 'กำลังดำเนินการ…'
-                        : 'ซิงก์ Pixel IDs และ Commit Git'}
-                      {!busy && (
-                        <ArrowUpRight
-                          size={17}
-                          className="button-arrow"
-                        />
-                      )}
+                      + เพิ่มช่อง Pixel ID
                     </button>
 
-                    <div className="button-note">
-                      <LockKeyhole size={12} />
-                      GitHub App ทำงานบนเซิร์ฟเวอร์ ไม่ใช้ Token ในหน้าเว็บ
+                    <div className="pixel-list-summary">
+                      {pixelRows.length} ช่อง · แก้ไขหรือลบเฉพาะช่องที่เลือก
                     </div>
-                  </>
-                )}
+                  </div>
+
+                  <div className="field-hint">
+                    <CircleHelp size={14} />
+                    เมื่อ Commit ระบบจะซิงก์ ID ทั้งหมดที่แสดงให้ตรงกันใน
+                    fbq init และ noscript
+                  </div>
+                </div>
+
+                <div className="field-group">
+                  <label htmlFor="commit-message">Commit message</label>
+                  <div className="input-wrap">
+                    <GitCommitHorizontal size={17} />
+                    <input
+                      id="commit-message"
+                      value={commitMessage}
+                      onChange={(e) => setCommitMessage(e.target.value)}
+                      maxLength={120}
+                    />
+                  </div>
+                </div>
+
+                <div className="divider" />
+
+                <button
+                  className="commit-button"
+                  disabled={busy || !selected || !pixelIsValid}
+                  onClick={commitPixel}
+                >
+                  {busy ? (
+                    <RefreshCw className="spin" size={18} />
+                  ) : (
+                    <UploadCloud size={19} />
+                  )}
+                  {busy
+                    ? 'กำลังดำเนินการ…'
+                    : 'ซิงก์ Pixel IDs และ Commit Git'}
+                  {!busy && (
+                    <ArrowUpRight size={17} className="button-arrow" />
+                  )}
+                </button>
+
+                <div className="button-note">
+                  <LockKeyhole size={12} />
+                  GitHub App ทำงานบนเซิร์ฟเวอร์ ไม่ใช้ Token ในหน้าเว็บ
+                </div>
               </>
             )}
           </section>
@@ -728,6 +661,7 @@ function App() {
                 </div>
                 <div>
                   <h2>Target Repository</h2>
+                  
                 </div>
               </div>
 
@@ -753,15 +687,7 @@ function App() {
                   ? 'Repository configured'
                   : 'กรุณาแก้ src/config.js ก่อนใช้งาน'}
               </div>
-
-              <button
-                className="load-pixels-button"
-                type="button"
-                onClick={() => setShowSecurity((value) => !value)}
-              >
-                <ShieldCheck size={14} />
-                {showSecurity ? 'ซ่อนคำแนะนำความปลอดภัย' : 'คำแนะนำความปลอดภัย'}
-              </button>
+           
 
               {showSecurity && (
                 <div className="security-details">
@@ -774,15 +700,11 @@ function App() {
                     </li>
                     <li>
                       ตั้งค่า GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY,
-                      GITHUB_INSTALLATION_ID, SESSION_SECRET และ
-                      ADMIN_USERNAME บนเซิร์ฟเวอร์
+                      GITHUB_INSTALLATION_ID, SESSION_SECRET และ ADMIN_USERNAME
+                      บนเซิร์ฟเวอร์
                     </li>
                     <li>
                       กำหนด USER_1 ถึง USER_5 ทั้ง username และ password
-                    </li>
-                    <li>
-                      กำหนด accessiblePageIds จาก Backend และตรวจสิทธิ์
-                      ทุก API ที่อ่านหรือ Commit
                     </li>
                     <li>ห้ามเปิดเผย private key หรือไฟล์ .env</li>
                   </ol>
