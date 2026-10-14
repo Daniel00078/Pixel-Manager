@@ -7,6 +7,8 @@ export const SALES_PAGES = [
     repo: 'sale-page',
     branch: 'main',
     path: 'index.html',
+    adminOnly: true,
+
   },
   {
     id: 'sales-page-02',
