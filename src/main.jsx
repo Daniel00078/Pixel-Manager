@@ -639,7 +639,7 @@ function App() {
                   )}
                   {busy
                     ? 'กำลังดำเนินการ…'
-                    : 'ซิงก์ Pixel IDs และ Commit Git'}
+                    : 'บันทึก Pixel IDs และ Commit Git'}
                   {!busy && (
                     <ArrowUpRight size={17} className="button-arrow" />
                   )}
