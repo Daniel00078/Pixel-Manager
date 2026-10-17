@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 
 import express from 'express';
@@ -6,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import session from 'express-session';
 import helmet from 'helmet';
 import { App as GitHubApp } from '@octokit/app';
-
 import { SALES_PAGES } from './src/config.js';
 
 const app = express();
@@ -16,23 +16,21 @@ const distPath = path.join(__dirname, 'dist');
 const PORT = Number(process.env.PORT || 3001);
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const SESSION_COOKIE = 'pixel_manager_session';
+const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
 
 app.disable('x-powered-by');
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 
 // --------------------------------------------------
-// 1. Users and configuration
+// Users and configuration
 // --------------------------------------------------
 
-const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
-
 const USERS = Array.from({ length: 5 }, (_, index) => {
-  const number = index + 1;
-
+  const n = index + 1;
   return {
-    username: (process.env[`USER_${number}_USERNAME`] || '').trim(),
-    password: process.env[`USER_${number}_PASSWORD`] || '',
+    username: (process.env[`USER_${n}_USERNAME`] || '').trim(),
+    password: process.env[`USER_${n}_PASSWORD`] || '',
   };
 }).filter((user) => user.username && user.password);
 
@@ -45,25 +43,28 @@ function isConfigured() {
     process.env.GITHUB_APP_ID &&
     process.env.GITHUB_APP_PRIVATE_KEY &&
     process.env.GITHUB_INSTALLATION_ID &&
-    ADMIN_USERNAME &&
     getUser(ADMIN_USERNAME) &&
     USERS.length > 0
   );
 }
 
 // --------------------------------------------------
-// 2. Session
+// Session
 // --------------------------------------------------
+
+app.set('trust proxy', 1);
 
 app.use(
   session({
     name: SESSION_COOKIE,
-    secret: process.env.SESSION_SECRET || 'development-only-change-this-secret',
+    secret:
+      process.env.SESSION_SECRET ||
+      'development-only-change-this-secret',
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: IS_PRODUCTION ? 'none' : 'lax',
       secure: IS_PRODUCTION,
       maxAge: 8 * 60 * 60 * 1000,
     },
@@ -71,18 +72,23 @@ app.use(
 );
 
 // --------------------------------------------------
-// 3. GitHub App
+// GitHub App
 // --------------------------------------------------
 
-let githubApp = null;
+let githubApp;
 
 function getGitHubApp() {
   if (!isConfigured()) {
-    throw new Error('Server configuration is incomplete. Check environment variables.');
+    throw new Error(
+      'Server configuration incomplete. Check environment variables.'
+    );
   }
 
   if (!githubApp) {
-    const privateKey = process.env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n');
+    const privateKey = process.env.GITHUB_APP_PRIVATE_KEY.replace(
+      /\\n/g,
+      '\n'
+    );
 
     githubApp = new GitHubApp({
       appId: process.env.GITHUB_APP_ID,
@@ -104,7 +110,7 @@ async function getInstallationOctokit() {
 }
 
 // --------------------------------------------------
-// 4. Authentication and page permissions
+// Authentication and permissions
 // --------------------------------------------------
 
 function requireAuth(req, res, next) {
@@ -126,13 +132,8 @@ function isAdmin(req) {
 }
 
 function canAccessPage(username, page) {
-  if (username === ADMIN_USERNAME) {
-    return true;
-  }
-
-  if (page.adminOnly) {
-    return false;
-  }
+  if (username === ADMIN_USERNAME) return true;
+  if (page.adminOnly) return false;
 
   return (
     Array.isArray(page.assignedTo) &&
@@ -146,12 +147,10 @@ function availablePages(username) {
   );
 }
 
-function findPage(pageId) {
-  return SALES_PAGES.find((page) => page.id === pageId);
-}
-
 function requirePageAccess(req, res, next) {
-  const page = findPage(req.params.id);
+  const page = SALES_PAGES.find(
+    (item) => item.id === req.params.id
+  );
 
   if (!page) {
     return res.status(404).json({
@@ -187,7 +186,7 @@ function requirePageAccess(req, res, next) {
 }
 
 // --------------------------------------------------
-// 5. Helpers for reading and updating Pixel IDs
+// Pixel ID helpers
 // --------------------------------------------------
 
 function decodeGitHubFile(content) {
@@ -197,62 +196,168 @@ function decodeGitHubFile(content) {
 function extractPixelIds(html) {
   const ids = [];
   const pattern =
-    /\bfbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]\s*\)/g;
+    /\bfbq\s*\(\s*(['"])init\1\s*,\s*(['"])(\d+)\2\s*\)/g;
 
   let match;
-
   while ((match = pattern.exec(html)) !== null) {
-    ids.push(match[1]);
+    ids.push(match[3]);
   }
 
   return ids;
 }
 
 function normalizePixelIds(value) {
-  const rawIds = Array.isArray(value)
-    ? value
-    : typeof value === 'string'
-      ? value.split(/[\n,;]+/)
-      : null;
-
-  if (!rawIds) {
-    throw new Error('กรุณาส่ง Pixel ID เป็นรายการ');
+  if (!Array.isArray(value)) {
+    throw new Error('กรุณาส่ง Pixel ID ในรูปแบบรายการ');
   }
 
-  const ids = rawIds.map((id) => String(id).trim());
+  const ids = value.map((item) => String(item).trim());
 
-  if (ids.some((id) => !/^\d{1,30}$/.test(id))) {
-    throw new Error('Pixel ID ต้องเป็นตัวเลขเท่านั้น');
+  if (ids.length === 0) {
+    throw new Error('ต้องมี Pixel ID อย่างน้อย 1 รายการ');
+  }
+
+  if (ids.some((id) => !/^\d{5,25}$/.test(id))) {
+    throw new Error('Pixel ID ต้องเป็นตัวเลข 5–25 หลัก');
+  }
+
+  if (new Set(ids).size !== ids.length) {
+    throw new Error('Pixel ID ห้ามซ้ำกัน');
   }
 
   return ids;
 }
 
-function replacePixelIds(html, newIds) {
-  let index = 0;
+/**
+ * Replace all fbq init calls with the new list.
+ * Supports increasing or decreasing the number of IDs.
+ */
+function replaceInitIds(html, newIds) {
+  const pattern =
+    /\bfbq\s*\(\s*(['"])init\1\s*,\s*(['"])\d+\2\s*\)\s*;?/g;
 
-  const updatedHtml = html.replace(
-    /(\bfbq\s*\(\s*['"]init['"]\s*,\s*['"])\d+(['"]\s*\))/g,
-    (fullMatch, before, after) => {
-      if (index >= newIds.length) {
-        return fullMatch;
-      }
+  const matches = [...html.matchAll(pattern)];
 
-      const replacement = `${before}${newIds[index]}${after}`;
-      index += 1;
-
-      return replacement;
-    }
-  );
-
-  if (index !== newIds.length) {
+  if (matches.length === 0) {
     throw new Error(
-      `จำนวน Pixel ID ใหม่ (${newIds.length}) ไม่ตรงกับตำแหน่งที่พบในไฟล์ (${index})`
+      'ไม่พบ fbq init ใน index.html จึงไม่สามารถแก้ Pixel ID ได้'
     );
   }
 
-  return updatedHtml;
+  const first = matches[0];
+  const quote = first[1];
+  const indent =
+    html.slice(0, first.index).match(/(?:^|\n)([ \t]*)[^\n]*$/)?.[1] ||
+    '    ';
+
+  const replacement = newIds
+    .map((id) => `fbq(${quote}init${quote}, ${quote}${id}${quote});`)
+    .join('\n' + indent);
+
+  let output = '';
+  let cursor = 0;
+
+  matches.forEach((match, index) => {
+    output += html.slice(cursor, match.index);
+
+    if (index === 0) {
+      output += replacement;
+    }
+
+    cursor = match.index + match[0].length;
+  });
+
+  output += html.slice(cursor);
+  return output;
 }
+
+/**
+ * Replace the noscript tracking images so their IDs match fbq init.
+ * Clones the existing image markup to preserve its query parameters.
+ */
+function replaceNoscriptIds(html, newIds) {
+  const imgPattern =
+    /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])[^>]*\/?>/gi;
+
+  const matches = [...html.matchAll(imgPattern)];
+
+  if (matches.length === 0) {
+    throw new Error(
+      'ไม่พบ Facebook Pixel noscript image ใน index.html'
+    );
+  }
+
+  const firstImage = matches[0][0];
+
+  if (!/[?&]id=\d+/.test(firstImage)) {
+    throw new Error(
+      'ไม่พบพารามิเตอร์ id ใน noscript image'
+    );
+  }
+
+  const replacement = newIds
+    .map((id) =>
+      firstImage.replace(
+        /([?&]id=)\d+/,
+        (_, prefix) => `${prefix}${id}`
+      )
+    )
+    .join('\n');
+
+  let output = '';
+  let cursor = 0;
+
+  matches.forEach((match, index) => {
+    output += html.slice(cursor, match.index);
+
+    if (index === 0) {
+      output += replacement;
+    }
+
+    cursor = match.index + match[0].length;
+  });
+
+  output += html.slice(cursor);
+  return output;
+}
+
+function rewritePixelIds(html, newIds) {
+  let updated = replaceInitIds(html, newIds);
+  updated = replaceNoscriptIds(updated, newIds);
+
+  const finalIds = extractPixelIds(updated);
+
+  if (
+    finalIds.length !== newIds.length ||
+    finalIds.some((id, index) => id !== newIds[index])
+  ) {
+    throw new Error('ตรวจสอบ Pixel ID หลังแก้ไขไม่ผ่าน');
+  }
+
+  const noscriptIds = [
+    ...updated.matchAll(
+      /<img\b(?=[^>]*\bsrc\s*=\s*["'][^"']*facebook\.com\/tr\?[^"']*["'])[^>]*>/gi
+    ),
+  ].map((match) => {
+    const id = match[0].match(/[?&]id=(\d+)/);
+    return id?.[1] || '';
+  });
+
+  if (
+    noscriptIds.length !== newIds.length ||
+    noscriptIds.some((id, index) => id !== newIds[index])
+  ) {
+    throw new Error(
+      'Pixel ID ใน noscript ไม่ตรงกับ fbq init หลังแก้ไข'
+    );
+  }
+
+  return updated;
+}
+
+// --------------------------------------------------
+// GitHub file helpers
+// --------------------------------------------------
 
 async function readPageFile(page) {
   const octokit = await getInstallationOctokit();
@@ -267,8 +372,14 @@ async function readPageFile(page) {
     }
   );
 
-  if (Array.isArray(response.data) || response.data.type !== 'file') {
-    throw new Error('ตำแหน่งที่กำหนดใน GitHub ไม่ใช่ไฟล์');
+  if (
+    Array.isArray(response.data) ||
+    response.data.type !== 'file' ||
+    !response.data.content
+  ) {
+    throw new Error(
+      'ไม่พบไฟล์หรืออ่านเนื้อหาไฟล์จาก GitHub ไม่ได้'
+    );
   }
 
   return {
@@ -278,13 +389,13 @@ async function readPageFile(page) {
 }
 
 // --------------------------------------------------
-// 6. API: Status
+// API: status
 // --------------------------------------------------
 
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
 
-  return res.json({
+  res.json({
     configured: isConfigured(),
     authenticated: Boolean(
       req.session?.authenticated && req.session?.username
@@ -295,16 +406,15 @@ app.get('/api/status', (req, res) => {
 });
 
 // --------------------------------------------------
-// 7. API: Login
+// API: login
 // --------------------------------------------------
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', (req, res) => {
   res.set('Cache-Control', 'no-store');
 
   if (!isConfigured()) {
     return res.status(500).json({
-      error: 'การตั้งค่าเซิร์ฟเวอร์ไม่ครบ กรุณาตรวจสอบไฟล์ .env',
-      code: 'SERVER_NOT_CONFIGURED',
+      error: 'การตั้งค่าเซิร์ฟเวอร์ไม่ครบ กรุณาตรวจสอบ Environment Variables',
     });
   }
 
@@ -323,16 +433,14 @@ app.post('/api/login', async (req, res) => {
   if (!user || user.password !== password) {
     return res.status(401).json({
       error: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',
-      code: 'INVALID_CREDENTIALS',
     });
   }
 
   req.session.regenerate((error) => {
     if (error) {
-      console.error('Session regeneration failed:', error);
-
+      console.error('Session regenerate error:', error);
       return res.status(500).json({
-        error: 'ไม่สามารถสร้างเซสชันได้',
+        error: 'สร้างเซสชันไม่สำเร็จ',
       });
     }
 
@@ -341,10 +449,9 @@ app.post('/api/login', async (req, res) => {
 
     req.session.save((saveError) => {
       if (saveError) {
-        console.error('Session save failed:', saveError);
-
+        console.error('Session save error:', saveError);
         return res.status(500).json({
-          error: 'ไม่สามารถบันทึกเซสชันได้',
+          error: 'บันทึกเซสชันไม่สำเร็จ',
         });
       }
 
@@ -358,7 +465,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // --------------------------------------------------
-// 8. API: Logout
+// API: logout
 // --------------------------------------------------
 
 app.post('/api/logout', (req, res) => {
@@ -370,8 +477,7 @@ app.post('/api/logout', (req, res) => {
 
   req.session.destroy((error) => {
     if (error) {
-      console.error('Session destroy failed:', error);
-
+      console.error('Session destroy error:', error);
       return res.status(500).json({
         error: 'ออกจากระบบไม่สำเร็จ',
       });
@@ -379,7 +485,7 @@ app.post('/api/logout', (req, res) => {
 
     res.clearCookie(SESSION_COOKIE, {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: IS_PRODUCTION ? 'none' : 'lax',
       secure: IS_PRODUCTION,
     });
 
@@ -388,16 +494,13 @@ app.post('/api/logout', (req, res) => {
 });
 
 // --------------------------------------------------
-// 9. API: List pages
-// IMPORTANT: This route must be before the frontend fallback.
+// API: list pages
 // --------------------------------------------------
 
 app.get('/api/pages', requireAuth, (req, res) => {
   res.set('Cache-Control', 'no-store');
 
-  const username = req.session.username;
-
-  const pages = availablePages(username).map((page) => ({
+  const pages = availablePages(req.session.username).map((page) => ({
     id: page.id,
     name: page.name,
     description: page.description || '',
@@ -405,11 +508,11 @@ app.get('/api/pages', requireAuth, (req, res) => {
     path: page.path,
   }));
 
-  return res.status(200).json({ pages });
+  return res.json({ pages });
 });
 
 // --------------------------------------------------
-// 10. API: Read Pixel IDs from a page
+// API: read Pixel IDs
 // --------------------------------------------------
 
 app.get(
@@ -427,7 +530,7 @@ app.get(
         sha,
       });
     } catch (error) {
-      console.error('Read page failed:', error);
+      console.error('Read page error:', error);
 
       return res.status(502).json({
         error: 'อ่านไฟล์จาก GitHub ไม่สำเร็จ',
@@ -438,7 +541,7 @@ app.get(
 );
 
 // --------------------------------------------------
-// 11. API: Save Pixel IDs to GitHub
+// API: commit Pixel IDs
 // --------------------------------------------------
 
 app.post(
@@ -449,23 +552,19 @@ app.post(
     res.set('Cache-Control', 'no-store');
 
     try {
-      const suppliedIds = req.body?.ids ?? req.body?.pixelIds;
-      const newIds = normalizePixelIds(suppliedIds);
-
+      const newIds = normalizePixelIds(req.body?.ids);
       const page = req.salesPage;
+
       const { html, sha } = await readPageFile(page);
-      const oldIds = extractPixelIds(html);
+      const updatedHtml = rewritePixelIds(html, newIds);
 
-      if (oldIds.length !== newIds.length) {
-        return res.status(400).json({
-          error: `จำนวน Pixel ID ใหม่ต้องเท่ากับจำนวนเดิม (${oldIds.length})`,
-          existingCount: oldIds.length,
-          receivedCount: newIds.length,
-        });
-      }
-
-      const updatedHtml = replacePixelIds(html, newIds);
       const octokit = await getInstallationOctokit();
+
+      const message =
+        typeof req.body?.message === 'string' &&
+        req.body.message.trim()
+          ? req.body.message.trim().slice(0, 120)
+          : `Update Facebook Pixel IDs for ${page.name || page.id}`;
 
       const response = await octokit.request(
         'PUT /repos/{owner}/{repo}/contents/{path}',
@@ -474,32 +573,36 @@ app.post(
           repo: page.repo,
           path: page.path,
           branch: page.branch,
-          message: `Update Facebook Pixel IDs for ${page.name || page.id}`,
+          message,
           content: Buffer.from(updatedHtml, 'utf8').toString('base64'),
           sha,
         }
       );
 
+      const commitUrl =
+        response.data.commit?.html_url ||
+        response.data.content?.html_url ||
+        '';
+
       return res.json({
         ok: true,
         ids: newIds,
         commit: response.data.commit?.sha || null,
-        url: response.data.commit?.html_url || null,
+        commitUrl,
+        url: commitUrl,
       });
     } catch (error) {
-      console.error('Commit page failed:', error);
+      console.error('Commit Pixel IDs error:', error);
 
       return res.status(500).json({
-        error: 'บันทึก Pixel ID ไปยัง GitHub ไม่สำเร็จ',
-        details: error.message,
+        error: error.message || 'บันทึก Pixel ID ไปยัง GitHub ไม่สำเร็จ',
       });
     }
   }
 );
 
 // --------------------------------------------------
-// 12. Unknown API endpoints must return JSON, not HTML.
-// This must be before express.static and the frontend fallback.
+// Unknown API routes return JSON, never index.html
 // --------------------------------------------------
 
 app.use('/api', (req, res) => {
@@ -512,34 +615,25 @@ app.use('/api', (req, res) => {
 });
 
 // --------------------------------------------------
-// 13. Frontend static files
+// Frontend
 // --------------------------------------------------
 
 app.use(express.static(distPath));
 
-// --------------------------------------------------
-// 14. Frontend fallback
-// Do not use this to handle /api requests.
-// --------------------------------------------------
-
 app.get(/.*/, (req, res, next) => {
   res.sendFile(path.join(distPath, 'index.html'), (error) => {
-    if (error) {
-      next(error);
-    }
+    if (error) next(error);
   });
 });
 
 // --------------------------------------------------
-// 15. Error handler
+// Error handler
 // --------------------------------------------------
 
 app.use((error, req, res, next) => {
   console.error('Unhandled server error:', error);
 
-  if (res.headersSent) {
-    return next(error);
-  }
+  if (res.headersSent) return next(error);
 
   return res.status(500).json({
     error: 'เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์',
@@ -547,10 +641,10 @@ app.use((error, req, res, next) => {
 });
 
 // --------------------------------------------------
-// 16. Start server
+// Start
 // --------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log(`Pixel Control listening on http://localhost:${PORT}`);
-  console.log(`Environment configured: ${isConfigured()}`);
+  console.log(`Pixel Control listening on port ${PORT}`);
+  console.log(`Server configured: ${isConfigured()}`);
 });
