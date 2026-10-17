@@ -30,6 +30,16 @@ export const SALES_PAGES = [
     assignedTo: ['tk'],
   },
   {
+    id: 'TJ',
+    name: 'TJ',
+    description: 'เซลเพจ TJ',
+    owner: 'Daniel00078',
+    repo: 'TJ',
+    branch: 'main',
+    path: 'index.html',
+    assignedTo: ['tj'],
+  },
+  {
     id: 'Pd',
     name: 'Pd',
     description: 'เซลเพจสำหรับแอดมิน',
